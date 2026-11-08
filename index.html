@@ -118,7 +118,7 @@ var ARQ='dados.json';
 /* ================================================================== */
 (function(){
   var LOJAS=[{id:'09',k:'Matriz',c:'Santa Maria da Vitória',s:'Matriz SMV',v:'--l09'},{id:'13',k:'Filial',c:'Bom Jesus da Lapa',s:'B. J. Lapa',v:'--l13'},{id:'32',k:'Filial',c:'Coribe',s:'Coribe',v:'--l32'},{id:'70',k:'Filial',c:'Santa Maria da Vitória',s:'Filial SMV',v:'--l70'}];
-  var ST=null, TOKEN=null, OWNER=false, busy=false, cur=null, curLoja=null, flash='';
+  var ST=null, TOKEN=null, OWNER=false, HASKEY=null, KEY=null, busy=false, cur=null, curLoja=null, flash='';
   var API='https://api.github.com/repos/'+REPO+'/contents/'+ARQ;
   var $=function(id){return document.getElementById(id)};
   function esc(t){var d=document.createElement('div');d.textContent=t==null?'':String(t);return d.innerHTML}
@@ -178,15 +178,43 @@ var ARQ='dados.json';
     if(OWNER)wireOwner();else wireLogin();
   }
 
-  function loginHtml(){return '<div class="ov" id="lov" hidden><form class="dlg gate" id="lform"><b style="font-size:20px">Área do gerente</b><label class="lab" for="senha">Senha<input id="senha" type="password" autocomplete="current-password" required></label><span class="msg" id="lmsg" role="status"></span><div class="acts"><button class="btn ghost" type="button" id="lx">Cancelar</button><button class="btn" type="submit">Entrar</button></div></form></div>'}
+  function loginHtml(){
+    var setup=HASKEY===false;
+    var f=setup?
+      '<p class="foot" style="margin:0">Primeira vez: cole o código do GitHub e escolha a senha. Depois disso, só a senha é pedida.</p><label class="lab" for="tok">Código do GitHub<input id="tok" type="password" autocomplete="off" required></label><label class="lab" for="senha">Senha para dar baixa<input id="senha" type="password" autocomplete="new-password" required></label><label class="lab" for="senha2">Repita a senha<input id="senha2" type="password" autocomplete="new-password" required></label>'
+      :'<label class="lab" for="senha">Senha<input id="senha" type="password" autocomplete="current-password" required></label>';
+    return '<div class="ov" id="lov" hidden><form class="dlg gate" id="lform"><b style="font-size:20px">Área do gerente</b>'+f+'<span class="msg" id="lmsg" role="status"></span><div class="acts"><button class="btn ghost" type="button" id="lx">Cancelar</button><button class="btn" type="submit">Entrar</button></div></form></div>'}
+  /* senha curta: o código do GitHub fica guardado cifrado (AES-GCM, chave derivada da senha) em chave.json */
+  var KAPI='https://api.github.com/repos/'+REPO+'/contents/chave.json';
+  function u8(b){return Uint8Array.from(atob(b),function(c){return c.charCodeAt(0)})}
+  function b64(a){var s='';new Uint8Array(a).forEach(function(x){s+=String.fromCharCode(x)});return btoa(s)}
+  function derive(pw,salt,it){return crypto.subtle.importKey('raw',new TextEncoder().encode(pw),'PBKDF2',false,['deriveKey']).then(function(k){return crypto.subtle.deriveKey({name:'PBKDF2',salt:salt,iterations:it,hash:'SHA-256'},k,{name:'AES-GCM',length:256},false,['encrypt','decrypt'])})}
+  function fetchKey(){return fetch(KAPI+'?ref='+BRANCH+'&t='+Date.now(),{headers:{'Accept':'application/vnd.github.raw+json'},cache:'no-store'}).then(function(r){return r.ok?r.json():null}).catch(function(){return fetch('chave.json?t='+Date.now(),{cache:'no-store'}).then(function(r){return r.ok?r.json():null}).catch(function(){return null})})}
+  function decTok(k,pw){return derive(pw,u8(k.salt),k.it).then(function(key){return crypto.subtle.decrypt({name:'AES-GCM',iv:u8(k.iv)},key,u8(k.ct))}).then(function(b){return new TextDecoder().decode(b)})}
+  function encTok(tok,pw){var salt=crypto.getRandomValues(new Uint8Array(16)),iv=crypto.getRandomValues(new Uint8Array(12)),it=600000;
+    return derive(pw,salt,it).then(function(key){return crypto.subtle.encrypt({name:'AES-GCM',iv:iv},key,new TextEncoder().encode(tok))}).then(function(ct){return {v:1,it:it,salt:b64(salt),iv:b64(iv),ct:b64(ct)}})}
+  function saveKey(obj){var h={'Accept':'application/vnd.github+json','Authorization':'Bearer '+TOKEN};
+    return fetch(KAPI+'?ref='+BRANCH+'&t='+Date.now(),{headers:h,cache:'no-store'}).then(function(r){return r.ok?r.json():null}).then(function(f){
+      var body={message:'Senha da Área do gerente',content:b64enc(JSON.stringify(obj)),branch:BRANCH};if(f&&f.sha)body.sha=f.sha;
+      return fetch(KAPI,{method:'PUT',headers:Object.assign({'Content-Type':'application/json'},h),body:JSON.stringify(body)}).then(function(r){if(!r.ok)throw r.status})})}
   function wireLogin(){
-    $('entrar').addEventListener('click',function(){$('lov').hidden=false;$('senha').focus()});
+    $('entrar').addEventListener('click',function(){$('lov').hidden=false;($('tok')||$('senha')).focus()});
     $('lx').addEventListener('click',function(){$('lov').hidden=true});
     $('lov').addEventListener('keydown',function(e){if(e.key==='Escape')$('lov').hidden=true});
-    $('lform').addEventListener('submit',function(e){e.preventDefault();var t=$('senha').value.trim(),m=$('lmsg');if(!t)return;m.className='msg';m.textContent='Conferindo…';
-      fetch('https://api.github.com/repos/'+REPO,{headers:{'Accept':'application/vnd.github+json','Authorization':'Bearer '+t}}).then(function(r){return r.ok?r.json():null}).then(function(j){
-        if(j&&j.permissions&&j.permissions.push){TOKEN=t;OWNER=true;try{localStorage.setItem('cp-token',t)}catch(x){}load()}
-        else{m.className='msg err';m.textContent='Senha incorreta.'}}).catch(function(){m.className='msg err';m.textContent='Sem conexão. Tente de novo.'})});
+    function check(t){return fetch('https://api.github.com/repos/'+REPO,{headers:{'Accept':'application/vnd.github+json','Authorization':'Bearer '+t}}).then(function(r){return r.ok?r.json():null}).then(function(j){return j&&j.permissions&&j.permissions.push?t:null})}
+    function enter(t){TOKEN=t;OWNER=true;try{localStorage.setItem('cp-token',t)}catch(x){}load()}
+    $('lform').addEventListener('submit',function(e){e.preventDefault();var s=$('senha').value.trim(),m=$('lmsg');if(!s)return;m.className='msg';m.textContent='Conferindo…';
+      if($('tok')){
+        var tk=$('tok').value.trim();
+        if(s!==$('senha2').value.trim()){m.className='msg err';m.textContent='As senhas não são iguais.';return}
+        if(s.length<6){m.className='msg err';m.textContent='Use uma senha com pelo menos 6 caracteres.';return}
+        check(tk).then(function(t){if(!t)throw 'tok';TOKEN=t;return encTok(t,s).then(saveKey).then(function(){HASKEY=true;KEY=null;enter(t);flash='Senha criada. A partir de agora, use só ela para entrar.'})})
+        .catch(function(err){m.className='msg err';m.textContent=err==='tok'?'Código do GitHub inválido ou sem permissão.':'Não foi possível salvar. Tente de novo.'});
+        return;
+      }
+      (KEY?Promise.resolve(KEY):fetchKey()).then(function(k){if(!k)throw 'semchave';return decTok(k,s)}).then(check)
+      .then(function(t){if(t)enter(t);else{m.className='msg err';m.textContent='Senha incorreta.'}})
+      .catch(function(err){m.className='msg err';m.textContent=err==='semchave'?'A senha ainda não foi criada.':(err&&err.name==='OperationError'?'Senha incorreta.':'Sem conexão. Tente de novo.')})});
   }
 
   function ownerExtras(){
@@ -200,7 +228,8 @@ var ARQ='dados.json';
     return '<details class="more" id="d1"><summary>Baixas feitas · '+v.length+'</summary>'+hist+'</details>'+
       '<details class="more" id="d2"><summary>Comissões por vendedor</summary><div class="box" style="border:1px solid var(--line)"><table><thead><tr><th class="p">Vendedor</th><th>15L</th><th>3L</th><th>Comissão</th></tr></thead><tbody>'+(cb||'<tr><td colspan="4" class="zero">Aparece conforme as baixas forem feitas.</td></tr>')+'</tbody><tfoot><tr><td class="p">Total</td><td>'+a+'</td><td>'+b+'</td><td>'+brl(a*ST.l15+b*ST.l3)+'</td></tr></tfoot></table></div>'+
       '<div class="cfg"><label for="c15">R$ por balde 15L<input id="c15" type="number" min="0" step="0.5" value="'+ST.l15+'"></label><label for="c3">R$ por galão 3L<input id="c3" type="number" min="0" step="0.5" value="'+ST.l3+'"></label><button class="btn ghost" id="c-salvar" type="button">Salvar valores</button><span class="msg" id="c-msg" role="status"></span></div></details>'+
-      '<details class="more" id="d3"><summary>Corrigir estoque inicial</summary><p class="foot" style="margin:0">Ajuste o estoque de partida de uma loja; as baixas continuam descontando.</p><div class="cfg"><label for="a-prod">Produto<select id="a-prod">'+opts+'</select></label><label for="a-loja">Loja<select id="a-loja">'+LOJAS.map(function(l){return '<option value="'+l.id+'">Loja '+l.id+'</option>'}).join('')+'</select></label><label for="a-qtd">Estoque inicial<input id="a-qtd" type="number" min="0" step="1" inputmode="numeric"></label><button class="btn ghost" id="a-salvar" type="button">Salvar ajuste</button><span class="msg" id="a-msg" role="status"></span></div></details>';
+      '<details class="more" id="d3"><summary>Corrigir estoque inicial</summary><p class="foot" style="margin:0">Ajuste o estoque de partida de uma loja; as baixas continuam descontando.</p><div class="cfg"><label for="a-prod">Produto<select id="a-prod">'+opts+'</select></label><label for="a-loja">Loja<select id="a-loja">'+LOJAS.map(function(l){return '<option value="'+l.id+'">Loja '+l.id+'</option>'}).join('')+'</select></label><label for="a-qtd">Estoque inicial<input id="a-qtd" type="number" min="0" step="1" inputmode="numeric"></label><button class="btn ghost" id="a-salvar" type="button">Salvar ajuste</button><span class="msg" id="a-msg" role="status"></span></div></details>'+
+      '<details class="more" id="d4"'+(HASKEY===false?' open':'')+'><summary>Senha da Área do gerente</summary><p class="foot" style="margin:0">'+(HASKEY===false?'<b>Crie a senha de baixa agora:</b> depois disso, para entrar em qualquer aparelho, basta digitar essa senha. ':'')+'Crie ou troque a senha que você digita para entrar. Use pelo menos 10 caracteres, misturando letras, números e símbolos.</p><div class="cfg"><label for="p1">Nova senha<input id="p1" type="password" autocomplete="new-password"></label><label for="p2">Repita a senha<input id="p2" type="password" autocomplete="new-password"></label><button class="btn ghost" id="p-salvar" type="button">Salvar senha</button><span class="msg" id="p-msg" role="status"></span></div></details>';
   }
   function dlgHtml(){var vs={};ST.baixas.forEach(function(b){if(b.vend)vs[b.vend.trim()]=1});
     return '<div class="ov" id="ov" hidden><form class="dlg" id="dlg" role="dialog" aria-modal="true" aria-labelledby="dlg-t"><div class="dlg-h"><span class="sw" id="dlg-sw"></span><b id="dlg-t">Baixar</b></div><div class="lab">Loja</div><div class="lsel" id="dlg-lojas"></div><div class="row2c"><label class="lab" for="f-qtd">Quantidade<input id="f-qtd" type="number" min="1" step="1" value="1" inputmode="numeric" required></label><label class="lab" for="f-vend">Vendedor<input id="f-vend" list="dl-vend" placeholder="Nome do vendedor" autocomplete="off" required></label><datalist id="dl-vend">'+Object.keys(vs).sort().map(function(n){return '<option value="'+esc(n)+'"></option>'}).join('')+'</datalist></div><span class="msg" id="msg" role="status"></span><div class="acts"><button class="btn ghost" type="button" id="dlg-x">Cancelar</button><button class="btn" type="submit" id="dlg-ok">Dar baixa</button></div></form></div>'}
@@ -237,12 +266,16 @@ var ARQ='dados.json';
       m.className='msg';m.textContent='Salvando…';save(function(d){d.l15=a;d.l3=b},'Comissões: 15L '+a+' / 3L '+b).then(function(){flash='Comissões salvas.';render()},function(err){m.className='msg err';m.textContent=errText(err)})});
     function syncAdm(){var it=ST.items.find(function(i){return i.id===$('a-prod').value});if(it)$('a-qtd').value=it.est[$('a-loja').value]||0}
     $('a-prod').addEventListener('change',syncAdm);$('a-loja').addEventListener('change',syncAdm);syncAdm();
+    $('p-salvar').addEventListener('click',function(){var a=$('p1').value,b=$('p2').value,m=$('p-msg');
+      if(a.length<6){m.className='msg err';m.textContent='Use pelo menos 6 caracteres.';return}if(a!==b){m.className='msg err';m.textContent='As senhas não são iguais.';return}
+      m.className='msg';m.textContent='Salvando…';encTok(TOKEN,a).then(saveKey).then(function(){HASKEY=true;KEY=null;m.className='msg ok';m.textContent='Senha salva. Use ela para entrar nos outros aparelhos.';$('p1').value='';$('p2').value=''},function(){m.className='msg err';m.textContent='Não foi possível salvar a senha.'})});
     $('a-salvar').addEventListener('click',function(){var id=$('a-prod').value,l=$('a-loja').value,q=parseInt($('a-qtd').value,10),m=$('a-msg');if(!(q>=0)){m.className='msg err';m.textContent='Valor inválido.';return}
       m.className='msg';m.textContent='Salvando…';save(function(d){var p=d.items.find(function(i){return i.id===id});if(!p)return false;p.est[l]=q},'Ajuste de estoque '+id+' loja '+l+': '+q).then(function(){flash='Estoque ajustado.';render()},function(err){m.className='msg err';m.textContent=errText(err)})});
   }
 
   try{TOKEN=localStorage.getItem('cp-token');OWNER=!!TOKEN}catch(e){}
   load();
+  fetchKey().then(function(k){KEY=k;HASKEY=!!k;if(!busy&&!document.querySelector(".ov:not([hidden])"))render()});
   /* vendedores: atualiza sozinho a cada 2 minutos */
   setInterval(function(){if(!busy&&!(document.querySelector('.ov:not([hidden])')))load()},120000);
 })();
